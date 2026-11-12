@@ -6,313 +6,397 @@ import random
 from datetime import datetime, timezone
 
 
-IN = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-OUT = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-PATHS = 4000
-PLACES = 5
-MICRO = 1_000_000
-BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+INPUT_ROOT = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+OUTPUT_ROOT = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+TRIALS = 4000
+PODIUM = 5
+TICKS_PER_UNIT = 1_000_000
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
-def hour(value):
-    if isinstance(value, (int, float)) and math.isfinite(value):
+def read_json_task():
+    location = os.path.join(INPUT_ROOT, "task.json")
+    with open(location, encoding="utf-8") as source:
+        payload = json.load(source)
+    if not isinstance(payload, dict):
+        raise TypeError("task payload must be a mapping")
+    return payload
+
+
+def report_edges(task_data):
+    try:
+        supplied = task_data["size"]["edges"]
+        if not isinstance(supplied, list) or len(supplied) != 81:
+            raise ValueError("the report needs exactly 81 edges")
+        parsed = [float(point) for point in supplied]
+        if any(not math.isfinite(point) for point in parsed):
+            raise ValueError("report edges must be finite")
+        if any(left >= right for left, right in zip(parsed, parsed[1:])):
+            raise ValueError("report edges must increase")
+        return parsed
+    except Exception:
+        return [2 + 0.05 * position for position in range(81)]
+
+
+def timestamp_in_hours(value):
+    numeric = isinstance(value, (int, float)) and math.isfinite(value)
+    if numeric:
         return float(value)
-    text = str(value).strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    moment = datetime.fromisoformat(text)
+    stamp = str(value).strip()
+    if stamp.endswith("Z"):
+        stamp = stamp[:-1] + "+00:00"
+    moment = datetime.fromisoformat(stamp)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.timestamp() / 3600.0
 
 
-def cap_of(row):
-    lamports = int(str(row["market_cap_lamports"]).strip())
-    if lamports <= 0:
-        raise ValueError("non-positive market cap")
-    return math.log10(lamports) - 9.0
-
-
-def edges_of(task):
-    try:
-        raw = task["size"]["edges"]
-        if not isinstance(raw, list) or len(raw) != 81:
-            raise ValueError("bad edges")
-        edges = [float(x) for x in raw]
-        if any(not math.isfinite(x) for x in edges):
-            raise ValueError("bad edge")
-        if any(a >= b for a, b in zip(edges, edges[1:])):
-            raise ValueError("unsorted edges")
-        return edges
-    except Exception:
-        return [2.0 + 0.05 * i for i in range(81)]
-
-
-def load_task():
-    with open(os.path.join(IN, "task.json"), encoding="utf-8") as handle:
-        task = json.load(handle)
-    if not isinstance(task, dict):
-        raise ValueError("task is not an object")
-    return task
-
-
-def load_marks():
-    marks = []
-    with open(os.path.join(IN, "history.ndjson"), encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
+def read_snapshots():
+    collected = []
+    location = os.path.join(INPUT_ROOT, "history.ndjson")
+    with open(location, encoding="utf-8") as source:
+        for raw_line in source:
+            line = raw_line.strip()
             if not line:
                 continue
             try:
-                mark = json.loads(line)
-                if not isinstance(mark, dict) or mark.get("ok") is False:
+                snapshot = json.loads(line)
+                if not isinstance(snapshot, dict):
                     continue
-                rows = mark.get("rows")
-                if not isinstance(rows, list):
+                if snapshot.get("ok") is False:
                     continue
-                at = hour(mark["at"])
-                marks.append((at, mark))
+                if not isinstance(snapshot.get("rows"), list):
+                    continue
+                collected.append((timestamp_in_hours(snapshot["at"]), snapshot))
             except Exception:
                 continue
-    if not marks:
-        raise ValueError("no usable marks")
-    marks.sort(key=lambda item: item[0])
-    return marks
+    if not collected:
+        raise ValueError("history has no usable snapshots")
+    collected.sort(key=lambda pair: pair[0])
+    return collected
 
 
-def normalise(items, cap):
-    """Round to 6 places, keep p >= .002, and keep the total at or below cap."""
-    if not items:
+def market_cap_dex(record):
+    lamports = int(str(record["market_cap_lamports"]).strip())
+    if lamports <= 0:
+        raise ValueError("market cap must be positive")
+    return math.log10(lamports) - 9.0
+
+
+def quantize_distribution(entries, ceiling):
+    if not entries:
         return []
-    total = math.fsum(p for _, p in items)
-    if not math.isfinite(total) or total <= 0.0:
+    mass = math.fsum(prob for _, prob in entries)
+    if not math.isfinite(mass) or mass <= 0.0:
         return []
-    scale = cap / total if total > cap else 1.0
-    kept = []
-    for key, p in items:
-        micro = int(round(p * scale * MICRO))
-        if micro >= 2000:
-            kept.append([key, micro])
-    if not kept:
+    factor = ceiling / mass if mass > ceiling else 1.0
+    rounded = []
+    for label, mass_fraction in entries:
+        ticks = int(round(mass_fraction * factor * TICKS_PER_UNIT))
+        if ticks >= 2000:
+            rounded.append([label, ticks])
+    if not rounded:
         return []
-    limit = int(round(cap * MICRO))
-    excess = sum(micro for _, micro in kept) - limit
-    if excess > 0:
-        index = max(range(len(kept)), key=lambda i: kept[i][1])
-        kept[index][1] -= excess
-        kept = [item for item in kept if item[1] >= 2000]
-    return [(key, micro / MICRO) for key, micro in kept]
+    allowance = int(round(ceiling * TICKS_PER_UNIT))
+    extra = sum(ticks for _, ticks in rounded) - allowance
+    if extra > 0:
+        biggest = max(range(len(rounded)), key=lambda pos: rounded[pos][1])
+        rounded[biggest][1] -= extra
+        rounded = [pair for pair in rounded if pair[1] >= 2000]
+    return [(label, ticks / TICKS_PER_UNIT) for label, ticks in rounded]
 
 
-def placeholders(count=5):
-    return ["1" * 43 + BASE58[i % len(BASE58)] for i in range(count)]
+def generated_mints(amount=5):
+    return [
+        "1" * 43 + ALPHABET[offset % len(ALPHABET)]
+        for offset in range(amount)
+    ]
 
 
-def fill_top(selected, known):
+def pad_top_five(preferred, alternatives):
     result = []
     seen = set()
-    for mint in list(selected) + list(known) + placeholders(5):
-        if isinstance(mint, str) and mint and mint not in seen:
-            seen.add(mint)
-            result.append(mint)
+    pool = [*preferred, *alternatives, *generated_mints(5)]
+    for item in pool:
+        if isinstance(item, str) and item and item not in seen:
+            seen.add(item)
+            result.append(item)
             if len(result) == 5:
                 break
     return result
 
 
-def compute(task, marks):
-    edges = edges_of(task)
-    reads = task.get("reads")
-    reads = reads if isinstance(reads, list) else []
-    last_hour = marks[-1][0]
-    ahead = []
-    for read in reads:
+def conservative_forecast(task_data, snapshots):
+    bounds = report_edges(task_data)
+    latest_rows = []
+    seen_mints = []
+    if snapshots:
+        latest_rows = [
+            row
+            for row in snapshots[-1][1].get("rows", [])
+            if isinstance(row, dict)
+        ]
         try:
-            delta = hour(read) - last_hour
-            if delta > 0.0 and math.isfinite(delta):
-                ahead.append(delta)
+            latest_rows.sort(key=lambda row: (int(row.get("rank", 10**9)), str(row.get("mint", ""))))
         except Exception:
             pass
-    if not ahead:
-        ahead = [1.0] * (len(reads) or 7)
+        for _, snapshot in reversed(snapshots):
+            for row in snapshot.get("rows", []):
+                mint = row.get("mint") if isinstance(row, dict) else None
+                if isinstance(mint, str) and mint and mint not in seen_mints:
+                    seen_mints.append(mint)
 
-    series = {}
-    for at, mark in marks:
-        for row in mark["rows"]:
+    ordered_mints = []
+    for row in latest_rows:
+        mint = row.get("mint")
+        if isinstance(mint, str) and mint and mint not in ordered_mints:
+            ordered_mints.append(mint)
+    top_five = pad_top_five(
+        ordered_mints[:5],
+        ordered_mints + seen_mints,
+    )
+
+    probabilities = []
+    sizes = []
+    for place in range(1, PODIUM + 1):
+        candidates = {}
+        if place <= len(latest_rows):
+            candidates[latest_rows[place - 1]["mint"]] = 0.60
+        if place > 1 and place - 2 < len(latest_rows):
+            mint = latest_rows[place - 2]["mint"]
+            candidates[mint] = candidates.get(mint, 0.0) + 0.15
+        if place < len(latest_rows):
+            mint = latest_rows[place]["mint"]
+            candidates[mint] = candidates.get(mint, 0.0) + 0.15
+        ranked = sorted(candidates.items(), key=lambda pair: (-pair[1], pair[0]))
+        for mint, chance in quantize_distribution(ranked, 0.68):
+            probabilities.append({"mint": mint, "place": place, "p": chance})
+        if place <= len(latest_rows):
+            try:
+                bucket = bisect.bisect_right(
+                    bounds,
+                    market_cap_dex(latest_rows[place - 1]),
+                )
+                sizes.append({"place": place, "bin": bucket, "p": 0.97})
+            except Exception:
+                pass
+    return {"probabilities": probabilities, "sizes": sizes, "top5": top_five}
+
+
+def simulate_forecast(task_data, snapshots):
+    bounds = report_edges(task_data)
+    requested = task_data.get("reads")
+    if not isinstance(requested, list):
+        requested = []
+    cutoff = snapshots[-1][0]
+    horizons = []
+    for read_at in requested:
+        try:
+            distance = timestamp_in_hours(read_at) - cutoff
+            if distance > 0.0 and math.isfinite(distance):
+                horizons.append(distance)
+        except Exception:
+            pass
+    if len(horizons) == 0:
+        horizons = [1.0] * (len(requested) or 7)
+
+    observations = {}
+    for moment, snapshot in snapshots:
+        for row in snapshot["rows"]:
             try:
                 mint = row["mint"]
                 if not isinstance(mint, str) or not mint:
                     continue
-                series.setdefault(mint, []).append((at, cap_of(row)))
+                level = market_cap_dex(row)
+                observations.setdefault(mint, []).append((moment, level))
             except Exception:
                 continue
-    if not series:
-        raise ValueError("no priced coins")
+    if not observations:
+        raise ValueError("no token has a usable market cap")
 
-    coins = []
-    residuals = []
-    for mint, observations in series.items():
-        observations.sort(key=lambda item: item[0])
-        first_t, first_x = observations[0]
-        last_t, last_x = observations[-1]
-        dt = last_t - first_t
-        if len(observations) >= 2 and dt > 0.0:
-            mu = min(0.35, max(-0.25, (last_x - first_x) / dt))
+    assets = []
+    step_variances = []
+    for mint, history in observations.items():
+        history.sort(key=lambda point: point[0])
+        start_time, start_level = history[0]
+        end_time, end_level = history[-1]
+        elapsed = end_time - start_time
+        if len(history) >= 2 and elapsed > 0.0:
+            individual_drift = min(
+                0.35,
+                max(-0.25, (end_level - start_level) / elapsed),
+            )
         else:
-            mu = 0.03
-        if len(observations) >= 2:
-            for (t1, x1), (t2, x2) in zip(observations, observations[1:]):
-                step = t2 - t1
-                if step > 0.0:
-                    residuals.append(((x2 - x1) - mu * step) ** 2 / step)
-        coins.append((mint, last_x, mu))
+            individual_drift = 0.03
+        if len(history) >= 2:
+            for (time_a, level_a), (time_b, level_b) in zip(history, history[1:]):
+                interval = time_b - time_a
+                if interval > 0.0:
+                    error = level_b - level_a - individual_drift * interval
+                    step_variances.append(error**2 / interval)
+        assets.append((mint, end_level, individual_drift))
 
-    # calibrasi: pakai median drift lintas coin (drift per-coin terlalu noise di 6 snapshot)
-    if coins:
-        med_mu = sorted(c[2] for c in coins)[len(coins) // 2]
-        coins = [(m, x, med_mu) for (m, x, _mu) in coins]
+    ordered_drifts = sorted(asset[2] for asset in assets)
+    median_drift = ordered_drifts[len(assets) // 2]
+    assets = [(mint, level, median_drift) for mint, level, _ in assets]
 
-    if residuals:
-        s_pool = math.sqrt(math.fsum(residuals) / len(residuals))
-        s_pool = min(0.60, max(0.02, s_pool))
+    if step_variances:
+        pooled_sigma = math.sqrt(
+            math.fsum(step_variances) / len(step_variances)
+        )
+        pooled_sigma = min(0.60, max(0.02, pooled_sigma))
     else:
-        s_pool = 0.12
+        pooled_sigma = 0.12
 
-    rng = random.Random(12345)
-    # kalibrasi: coin kecil (rank > 15) jauh lebih volatil -> sigma 1.8x, sisanya 1.3x
-    rank_now = {}
-    for row in marks[-1][1]["rows"]:
-        rank_now[row["mint"]] = int(row["rank"])
-    s_coin = {m: s_pool * (1.8 if rank_now.get(m, 10**9) > 15 else 1.3) for m, _x, _mu in coins}
-    place_counts = [dict() for _ in range(PLACES)]
-    place_bins = [dict() for _ in range(PLACES)]
-    samples = 0
-    for _ in range(PATHS):
-        for hours in ahead:
-            root_hours = math.sqrt(hours)
-            simulated = []
-            for mint, start, mu in coins:
-                x = start + mu * hours + min(0.40, s_coin[mint] * root_hours) * rng.gauss(0.0, 1.0)
-                simulated.append((mint, min(7.0, max(1.0, x))))
-            simulated.sort(key=lambda item: (-item[1], item[0]))
-            for place, (mint, x) in enumerate(simulated[:PLACES]):
-                counts = place_counts[place]
-                counts[mint] = counts.get(mint, 0) + 1
-                bin_number = bisect.bisect_right(edges, x)
-                bins = place_bins[place]
-                bins[bin_number] = bins.get(bin_number, 0) + 1
-            samples += 1
+    generator = random.Random(12345)
+    ranks = {}
+    for row in snapshots[-1][1]["rows"]:
+        ranks[row["mint"]] = int(row["rank"])
+    per_token_sigma = {}
+    for mint, _, _ in assets:
+        multiplier = 1.8 if ranks.get(mint, 10**9) > 15 else 1.3
+        per_token_sigma[mint] = pooled_sigma * multiplier
+
+    place_counts = [dict() for _ in range(PODIUM)]
+    place_buckets = [dict() for _ in range(PODIUM)]
+    draws = 0
+    for _ in range(TRIALS):
+        for horizon in horizons:
+            time_scale = math.sqrt(horizon)
+            projected = []
+            for mint, current_level, shared_drift in assets:
+                capped_sigma = min(
+                    0.44,
+                    per_token_sigma[mint] * time_scale,
+                )
+                shock = generator.gauss(0.0, 1.0)
+                next_level = (
+                    current_level
+                    + shared_drift * horizon
+                    + capped_sigma * shock
+                )
+                projected.append(
+                    (mint, min(7.0, max(1.0, next_level)))
+                )
+            projected.sort(key=lambda pair: (-pair[1], pair[0]))
+            for place, (mint, level) in enumerate(projected[:PODIUM]):
+                token_counts = place_counts[place]
+                token_counts[mint] = token_counts.get(mint, 0) + 1
+                bucket = bisect.bisect_right(bounds, level)
+                bucket_counts = place_buckets[place]
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+            draws += 1
 
     probabilities = []
-    for place in range(PLACES):
-        raw = [(mint, count / samples) for mint, count in place_counts[place].items()]
-        raw = [item for item in raw if item[1] >= 0.002]
-        raw.sort(key=lambda item: (-item[1], item[0]))
-        for mint, p in normalise(raw[:60], 0.72):
-            probabilities.append({"mint": mint, "place": place + 1, "p": p})
+    for place in range(PODIUM):
+        ranked = [
+            (mint, count / draws)
+            for mint, count in place_counts[place].items()
+        ]
+        ranked = [pair for pair in ranked if pair[1] >= 0.002]
+        ranked.sort(key=lambda pair: (-pair[1], pair[0]))
+        for mint, chance in quantize_distribution(ranked[:60], 0.68):
+            probabilities.append(
+                {"mint": mint, "place": place + 1, "p": chance}
+            )
 
     sizes = []
-    for place in range(PLACES):
-        raw = [(bin_number, count / samples) for bin_number, count in place_bins[place].items()]
-        raw = [item for item in raw if item[1] >= 0.002]
-        raw.sort(key=lambda item: (-item[1], item[0]))
-        for bin_number, p in sorted(normalise(raw[:60], 0.97)):
-            sizes.append({"place": place + 1, "bin": bin_number, "p": p})
+    for place in range(PODIUM):
+        ranked = [
+            (bucket, count / draws)
+            for bucket, count in place_buckets[place].items()
+        ]
+        ranked = [pair for pair in ranked if pair[1] >= 0.002]
+        ranked.sort(key=lambda pair: (-pair[1], pair[0]))
+        for bucket, chance in sorted(
+            quantize_distribution(ranked[:60], 0.97)
+        ):
+            sizes.append(
+                {"place": place + 1, "bin": bucket, "p": chance}
+            )
 
     totals = {}
-    best = {}
-    for row in probabilities:
-        mint, place, p = row["mint"], row["place"], row["p"]
-        totals[mint] = totals.get(mint, 0.0) + p
-        old = best.get(mint)
-        if old is None or place < old[0] or (place == old[0] and p > old[1]):
-            best[mint] = (place, p)
-    selected = sorted(totals, key=lambda mint: (-totals[mint], mint))[:5]
-    selected.sort(key=lambda mint: (best[mint][0], -best[mint][1], -totals[mint], mint))
-    known = [mint for mint, _, _ in sorted(coins, key=lambda item: (-item[1], item[0]))]
-    top5 = fill_top(selected, known)
-    return {"probabilities": probabilities, "sizes": sizes, "top5": top5}
-
-
-def fallback(task, marks):
-    edges = edges_of(task)
-    chart = []
-    known = []
-    if marks:
-        rows = [row for row in marks[-1][1].get("rows", []) if isinstance(row, dict)]
-        try:
-            rows.sort(key=lambda row: (int(row.get("rank", 10**9)), str(row.get("mint", ""))))
-        except Exception:
-            pass
-        chart = rows
-        for _, mark in reversed(marks):
-            for row in mark.get("rows", []):
-                mint = row.get("mint") if isinstance(row, dict) else None
-                if isinstance(mint, str) and mint and mint not in known:
-                    known.append(mint)
-
-    chart_mints = []
-    for row in chart:
-        mint = row.get("mint")
-        if isinstance(mint, str) and mint and mint not in chart_mints:
-            chart_mints.append(mint)
-    top5 = fill_top(chart_mints[:5], chart_mints + known)
-
-    probabilities = []
-    sizes = []
-    for place in range(1, PLACES + 1):
-        entries = {}
-        if place <= len(chart):
-            entries[chart[place - 1]["mint"]] = 0.60
-        if place > 1 and place - 2 < len(chart):
-            mint = chart[place - 2]["mint"]
-            entries[mint] = entries.get(mint, 0.0) + 0.15
-        if place < len(chart):
-            mint = chart[place]["mint"]
-            entries[mint] = entries.get(mint, 0.0) + 0.15
-        rows = sorted(entries.items(), key=lambda item: (-item[1], item[0]))
-        for mint, p in normalise(rows, 0.72):
-            probabilities.append({"mint": mint, "place": place, "p": p})
-        if place <= len(chart):
-            try:
-                bin_number = bisect.bisect_right(edges, cap_of(chart[place - 1]))
-                sizes.append({"place": place, "bin": bin_number, "p": 0.97})
-            except Exception:
-                pass
-    return {"probabilities": probabilities, "sizes": sizes, "top5": top5}
+    best_place = {}
+    for entry in probabilities:
+        mint = entry["mint"]
+        place = entry["place"]
+        chance = entry["p"]
+        totals[mint] = totals.get(mint, 0.0) + chance
+        previous = best_place.get(mint)
+        if (
+            previous is None
+            or place < previous[0]
+            or (place == previous[0] and chance > previous[1])
+        ):
+            best_place[mint] = (place, chance)
+    selected = sorted(
+        totals,
+        key=lambda mint: (-totals[mint], mint),
+    )[:5]
+    selected.sort(
+        key=lambda mint: (
+            best_place[mint][0],
+            -best_place[mint][1],
+            -totals[mint],
+            mint,
+        )
+    )
+    by_price = sorted(
+        assets,
+        key=lambda asset: (-asset[1], asset[0]),
+    )
+    known = [mint for mint, _, _ in by_price]
+    top_five = pad_top_five(selected, known)
+    return {"probabilities": probabilities, "sizes": sizes, "top5": top_five}
 
 
 def main():
     try:
-        os.makedirs(OUT, exist_ok=True)
-        task = {}
-        marks = []
+        os.makedirs(OUTPUT_ROOT, exist_ok=True)
+        task_data = {}
+        snapshots = []
         try:
-            task = load_task()
+            task_data = read_json_task()
         except Exception:
             pass
         try:
-            marks = load_marks()
+            snapshots = read_snapshots()
         except Exception:
             pass
         try:
-            forecast = compute(task, marks)
+            forecast = simulate_forecast(task_data, snapshots)
         except Exception:
             try:
-                forecast = fallback(task, marks)
+                forecast = conservative_forecast(task_data, snapshots)
             except Exception:
                 forecast = {
                     "probabilities": [],
                     "sizes": [],
-                    "top5": fill_top([], []),
+                    "top5": pad_top_five([], []),
                 }
-        with open(os.path.join(OUT, "forecast.json"), "w", encoding="utf-8") as handle:
-            json.dump(forecast, handle, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        destination = os.path.join(OUTPUT_ROOT, "forecast.json")
+        with open(destination, "w", encoding="utf-8") as target:
+            json.dump(
+                forecast,
+                target,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
     except Exception:
         try:
-            os.makedirs(OUT, exist_ok=True)
-            with open(os.path.join(OUT, "forecast.json"), "w", encoding="utf-8") as handle:
-                json.dump({"probabilities": [], "sizes": [], "top5": fill_top([], [])}, handle, separators=(",", ":"))
+            os.makedirs(OUTPUT_ROOT, exist_ok=True)
+            destination = os.path.join(OUTPUT_ROOT, "forecast.json")
+            with open(destination, "w", encoding="utf-8") as target:
+                json.dump(
+                    {
+                        "probabilities": [],
+                        "sizes": [],
+                        "top5": pad_top_five([], []),
+                    },
+                    target,
+                    separators=(",", ":"),
+                )
         except Exception:
             pass
 
