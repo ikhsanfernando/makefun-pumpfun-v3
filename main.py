@@ -238,7 +238,16 @@ def simulate_forecast(task_data, snapshots):
 
     ordered_drifts = sorted(asset[2] for asset in assets)
     median_drift = ordered_drifts[len(assets) // 2]
-    assets = [(mint, level, median_drift) for mint, level, _ in assets]
+    # age hazard: coin yang sudah tua kehilangan tenaga (log10 per jam)
+    cutoff_hours = timestamp_in_hours(snapshots[-1][0])
+    ages = {}
+    for row in snapshots[-1][1]["rows"]:
+        stamp = row.get("created_at")
+        ages[row["mint"]] = cutoff_hours - timestamp_in_hours(stamp) if stamp else 0.0
+    assets = [
+        (mint, level, median_drift - 0.004 * min(6.0, max(0.0, ages.get(mint, 0.0) - 18.0) / 12.0))
+        for mint, level, _ in assets
+    ]
 
     if step_variances:
         pooled_sigma = math.sqrt(
