@@ -173,10 +173,10 @@ def compute(task, marks):
         coins = [(m, x, med_mu) for (m, x, _mu) in coins]
 
     if residuals:
-        sigma = math.sqrt(math.fsum(residuals) / len(residuals))
-        sigma = min(0.60, max(0.02, sigma))
+        s_pool = math.sqrt(math.fsum(residuals) / len(residuals))
+        s_pool = min(0.60, max(0.02, s_pool))
     else:
-        sigma = 0.12
+        s_pool = 0.12
 
     rng = random.Random(12345)
     place_counts = [dict() for _ in range(PLACES)]
@@ -187,7 +187,7 @@ def compute(task, marks):
             root_hours = math.sqrt(hours)
             simulated = []
             for mint, start, mu in coins:
-                x = start + mu * hours + sigma * root_hours * rng.gauss(0.0, 1.0)
+                x = start + mu * hours + s_pool * root_hours * rng.gauss(0.0, 1.0)
                 simulated.append((mint, min(7.0, max(1.0, x))))
             simulated.sort(key=lambda item: (-item[1], item[0]))
             for place, (mint, x) in enumerate(simulated[:PLACES]):
