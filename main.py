@@ -192,7 +192,7 @@ def compute(task, marks):
             root_hours = math.sqrt(hours)
             simulated = []
             for mint, start, mu in coins:
-                x = start + mu * hours + min(0.42, s_coin[mint] * root_hours) * rng.gauss(0.0, 1.0)
+                x = start + mu * hours + min(0.40, s_coin[mint] * root_hours) * rng.gauss(0.0, 1.0)
                 simulated.append((mint, min(7.0, max(1.0, x))))
             simulated.sort(key=lambda item: (-item[1], item[0]))
             for place, (mint, x) in enumerate(simulated[:PLACES]):
@@ -208,7 +208,7 @@ def compute(task, marks):
         raw = [(mint, count / samples) for mint, count in place_counts[place].items()]
         raw = [item for item in raw if item[1] >= 0.002]
         raw.sort(key=lambda item: (-item[1], item[0]))
-        for mint, p in normalise(raw[:60], 0.75):
+        for mint, p in normalise(raw[:60], 0.72):
             probabilities.append({"mint": mint, "place": place + 1, "p": p})
 
     sizes = []
@@ -271,7 +271,7 @@ def fallback(task, marks):
             mint = chart[place]["mint"]
             entries[mint] = entries.get(mint, 0.0) + 0.15
         rows = sorted(entries.items(), key=lambda item: (-item[1], item[0]))
-        for mint, p in normalise(rows, 0.75):
+        for mint, p in normalise(rows, 0.72):
             probabilities.append({"mint": mint, "place": place, "p": p})
         if place <= len(chart):
             try:
