@@ -179,6 +179,11 @@ def compute(task, marks):
         s_pool = 0.12
 
     rng = random.Random(12345)
+    # kalibrasi: coin kecil (rank > 15) jauh lebih volatil -> sigma 1.8x, sisanya 1.3x
+    rank_now = {}
+    for row in marks[-1][1]["rows"]:
+        rank_now[row["mint"]] = int(row["rank"])
+    s_coin = {m: s_pool * (1.8 if rank_now.get(m, 10**9) > 15 else 1.3) for m, _x, _mu in coins}
     place_counts = [dict() for _ in range(PLACES)]
     place_bins = [dict() for _ in range(PLACES)]
     samples = 0
@@ -187,7 +192,7 @@ def compute(task, marks):
             root_hours = math.sqrt(hours)
             simulated = []
             for mint, start, mu in coins:
-                x = start + mu * hours + s_pool * root_hours * rng.gauss(0.0, 1.0)
+                x = start + mu * hours + min(0.42, s_coin[mint] * root_hours) * rng.gauss(0.0, 1.0)
                 simulated.append((mint, min(7.0, max(1.0, x))))
             simulated.sort(key=lambda item: (-item[1], item[0]))
             for place, (mint, x) in enumerate(simulated[:PLACES]):
